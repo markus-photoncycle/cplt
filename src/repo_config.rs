@@ -53,6 +53,7 @@ pub struct ProposeSection {
     /// Propose executing .NET Aspire's `dcp` orchestrator binary (see
     /// `sandbox.allow_dcp`).
     pub allow_dcp: Option<bool>,
+    pub allow_msbuild: Option<bool>,
     /// Propose installing the cplt-managed Gradle init script (see
     /// `sandbox.gradle_init`). Writes to the Gradle user home, so it goes
     /// through the same trust review as other sandbox relaxations.
@@ -266,6 +267,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
     if propose.allow_dcp == Some(true) {
         keys.push("allow_dcp");
+    }
+    if propose.allow_msbuild == Some(true) {
+        keys.push("allow_msbuild");
     }
     if propose.gradle_init == Some(true) {
         keys.push("gradle_init");

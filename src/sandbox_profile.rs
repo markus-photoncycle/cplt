@@ -69,6 +69,11 @@ pub struct ProfileOptions<'a> {
     /// packages folder is relocated outside `~/.nuget/packages` (the default
     /// location is already covered by `HOME_TOOL_DIRS`).
     pub nuget_packages: Option<&'a Path>,
+    /// DOTNET_ROOT directory for SDK read + dylib loading.
+    /// Needed when the .NET SDK is installed outside TOOL_READ_DIRS (e.g.
+    /// ~/hostedtoolcache via actions/setup-dotnet, or dotnet-install.sh into
+    /// a custom directory under $HOME).
+    pub dotnet_root: Option<&'a Path>,
     /// Global git hooks directory from `core.hooksPath`.
     /// Git needs to read and execute hooks from this directory for commits.
     pub git_hooks_path: Option<&'a Path>,
@@ -96,6 +101,8 @@ pub struct ProfileOptions<'a> {
     /// `allow_localhost_any` — kept separate so it stays independently
     /// reviewable in `.cplt.toml` propose blocks.
     pub allow_dcp: bool,
+    /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
+    pub allow_msbuild: bool,
     /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
     pub allow_docker: bool,
     /// Electron app bundle Contents directory (e.g., VS Code .app/Contents).
@@ -170,12 +177,14 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
     emit_java_home(&mut sb, opts.java_home);
     emit_dcp(&mut sb, &home, opts.nuget_packages, opts.allow_dcp);
+    emit_dotnet_root(&mut sb, opts.dotnet_root);
     emit_electron_app(&mut sb, opts.electron_app_dir);
     emit_system_files(&mut sb);
     emit_temp_rules(
         &mut sb,
         opts.allow_tmp_exec,
         opts.allow_jvm_attach,
+        opts.allow_msbuild,
         opts.scratch_dir,
         allow_chromium_runtime,
     );
@@ -896,6 +905,41 @@ fn emit_dcp_exec_carveout(sb: &mut String, packages_root: &str) {
     sbpl!(sb, "(deny file-write* (regex #\"{pattern}\"))");
 }
 
+/// Allow executing the dotnet host and loading .NET SDK libraries from DOTNET_ROOT.
+/// Needed when the SDK is installed outside TOOL_READ_DIRS — e.g.
+/// actions/setup-dotnet's ~/hostedtoolcache, or dotnet-install.sh into a
+/// custom directory under $HOME.
+fn emit_dotnet_root(sb: &mut String, dotnet_root: Option<&Path>) {
+    if let Some(dir) = dotnet_root {
+        let p = dir.to_string_lossy();
+        sbpl!(
+            sb,
+            ";; DOTNET_ROOT — dotnet host exec + SDK read/dylib loading"
+        );
+        sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+        // DOTNET_ROOT may be ~/.dotnet, whose writable CLI-state rule denies
+        // process execution. Re-allow only the trusted host, and keep it read-only.
+        sbpl!(sb, "(allow process-exec (literal \"{p}/dotnet\"))");
+        sbpl!(sb, "(deny file-write* (literal \"{p}/dotnet\"))");
+        // `dotnet build` doesn't just run the top-level host — MSBuild forks
+        // out-of-proc compiler workers straight out of the SDK install, e.g.
+        // {p}/sdk/<ver>/Roslyn/bincore/csc and VBCSCompiler, plus apphost
+        // templates copied out of {p}/sdk and {p}/shared. Without exec on
+        // these subtrees, `dotnet build` gets past restore/host-launch and
+        // then fails with "Operation not permitted" the moment MSBuild tries
+        // to spawn csc. Scoped to sdk/shared (not the whole DOTNET_ROOT) so
+        // CLI state files written directly under ~/.dotnet (telemetry
+        // sentinel, tool manifests) keep their normal write access, and these
+        // install directories stay read-only like the host binary above.
+        for subdir in ["sdk", "shared"] {
+            sbpl!(sb, "(allow process-exec (subpath \"{p}/{subdir}\"))");
+            sbpl!(sb, "(deny file-write* (subpath \"{p}/{subdir}\"))");
+        }
+        sbpl!(sb);
+    }
+}
+
 /// Allow reading and loading shared libraries from an Electron app bundle.
 /// Needed when Copilot CLI uses VS Code's (or similar editor's) Electron as its
 /// Node.js runtime — dyld must load `Electron Framework.framework` from within
@@ -934,6 +978,7 @@ fn emit_temp_rules(
     sb: &mut String,
     allow_tmp_exec: bool,
     allow_jvm_attach: bool,
+    allow_msbuild: bool,
     scratch_dir: Option<&Path>,
     allow_chromium_runtime: bool,
 ) {
@@ -996,6 +1041,38 @@ fn emit_temp_rules(
             r#"(allow network-bind (local unix-socket (regex #"^/private/var/folders/.+/T/\.java_pid")))"#,
             r#"(allow network-inbound (local unix-socket (regex #"^/private/var/folders/.+/T/\.java_pid")))"#,
             r#"(allow network-outbound (remote unix-socket (regex #"^/private/var/folders/.+/T/\.java_pid")))"#,
+        ] {
+            sbpl!(sb, "{op}");
+        }
+    }
+    if allow_msbuild {
+        // Allow Unix domain socket operations for MSBuild worker-node IPC.
+        //
+        // `dotnet build` forks out-of-proc worker nodes that communicate with
+        // the client over a Unix domain socket at /private/tmp/MSBuild<pid>
+        // (see NamedPipeUtil.GetPlatformSpecificPipeName in the MSBuild source).
+        //
+        // This is NOT the persistent MSBuild Server: that feature uses a
+        // differently-named socket, /private/tmp/MSBuildServer-<hash> (see
+        // MSBuild-Server.md's "pipe name convention"), which the regex below
+        // does not match and which therefore remains blocked. Reuse of a
+        // persistent server — including one started outside this sandbox — is
+        // additionally disabled by setting DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1
+        // (see sandbox_env.rs), so `dotnet build` never attempts to create or
+        // connect to that server pipe in the first place.
+        //
+        // All three socket operations are required (same pattern as JVM attach):
+        //   - network-bind:    the worker node creates the socket
+        //   - network-inbound: the worker node accepts client connections
+        //   - network-outbound: the client connects to the socket
+        //
+        // SECURITY: regex is anchored with ^ and $ to the exact MSBuild<pid>
+        // filename directly under /private/tmp — this does not grant broad
+        // /private/tmp socket access (SSH_AUTH_SOCK etc. remain unaffected).
+        for op in &[
+            r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#,
+            r#"(allow network-inbound (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#,
+            r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#,
         ] {
             sbpl!(sb, "{op}");
         }
@@ -1505,12 +1582,14 @@ mod tests {
             copilot_install_dir: None,
             java_home: None,
             nuget_packages: None,
+            dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
             allow_dcp: false,
+            allow_msbuild: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: crate::agent::Agent::Copilot,

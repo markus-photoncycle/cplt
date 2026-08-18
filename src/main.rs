@@ -375,6 +375,16 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     #[arg(long)]
     allow_dcp: bool,
 
+    /// Allow MSBuild worker-node unix sockets in /tmp.
+    /// Needed for `dotnet build`, which forks worker nodes that communicate
+    /// with the client over a Unix domain socket at /tmp/MSBuild<PID>.
+    /// This does NOT allow the persistent MSBuild Server (MSBuildServer-<hash>),
+    /// which stays blocked; reuse of that server is also disabled via
+    /// DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. SSH agent and all other unix
+    /// sockets remain blocked.
+    #[arg(long)]
+    allow_msbuild: bool,
+
     /// Allow Docker/Colima/OrbStack access inside the sandbox (DANGEROUS).
     #[arg(
         long,
@@ -1293,6 +1303,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
         allow_dcp: cli.allow_dcp,
+        allow_msbuild: cli.allow_msbuild,
         // Config-only opt-in; no CLI flag.
         gradle_init: false,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
@@ -2327,6 +2338,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, &home_dir));
 
+    // Discover DOTNET_ROOT for .NET SDK read access when installed outside
+    // TOOL_READ_DIRS (e.g. actions/setup-dotnet hostedtoolcache, or
+    // dotnet-install.sh into a custom directory under $HOME).
+    let dotnet_root_dir = std::env::var("DOTNET_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
+
     // Compute agent-specific sandbox directories
     let agent_dirs = active_agent.config_dirs(&home_dir);
 
@@ -2385,12 +2405,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         copilot_install_dir: copilot_install_dir.as_deref(),
         java_home: java_home_dir.as_deref(),
         nuget_packages: nuget_packages_dir.as_deref(),
+        dotnet_root: dotnet_root_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_dcp: resolved.allow_dcp,
+        allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
         electron_app_dir: electron_app_dir.as_deref(),
         agent: active_agent,
@@ -2841,6 +2863,15 @@ fn prepare_shell_sandbox(
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, home_dir));
 
+    // Discover DOTNET_ROOT for .NET SDK read access when installed outside
+    // TOOL_READ_DIRS (e.g. actions/setup-dotnet hostedtoolcache, or
+    // dotnet-install.sh into a custom directory under $HOME).
+    let dotnet_root_dir = std::env::var("DOTNET_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, home_dir));
+
     let agent_dirs = active_agent.config_dirs(home_dir);
     for dir in &agent_dirs {
         if !dir.path.exists() {
@@ -2887,12 +2918,14 @@ fn prepare_shell_sandbox(
         copilot_install_dir: None,
         java_home: java_home_dir.as_deref(),
         nuget_packages: nuget_packages_dir.as_deref(),
+        dotnet_root: dotnet_root_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_dcp: resolved.allow_dcp,
+        allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
         electron_app_dir: None,
         agent: active_agent,
@@ -4160,6 +4193,7 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
         let bools: &[(&str, Option<bool>)] = &[
             ("allow_localhost_any", rc.propose.allow_localhost_any),
             ("allow_jvm_attach", rc.propose.allow_jvm_attach),
+            ("allow_msbuild", rc.propose.allow_msbuild),
             ("allow_docker", rc.propose.allow_docker),
             ("allow_tmp_exec", rc.propose.allow_tmp_exec),
             ("allow_gpg_signing", rc.propose.allow_gpg_signing),

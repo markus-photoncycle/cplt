@@ -404,6 +404,13 @@ impl Config {
             self.sandbox.allow_dcp.unwrap_or(false)
         };
 
+        // Allow-msbuild: CLI flag wins, then config, then false (blocked by default)
+        let allow_msbuild = if cli.allow_msbuild {
+            true
+        } else {
+            self.sandbox.allow_msbuild.unwrap_or(false)
+        };
+
         // Gradle init script: config-only opt-in (default false). Writes a
         // cplt-managed file into the Gradle user home — behavior change the
         // user must explicitly ask for.
@@ -588,6 +595,7 @@ impl Config {
             deny_clipboard,
             allow_jvm_attach,
             allow_dcp,
+            allow_msbuild,
             gradle_init,
             allow_docker,
             allow_tmp_exec,
@@ -791,6 +799,11 @@ impl Resolved {
         if self.allow_dcp {
             eprintln!(
                 "{blue}[cplt]{nc}    Aspire DCP:    {yellow}allowed{nc}     {dim}dcp orchestrator exec (--allow-dcp){nc}"
+            );
+        }
+        if self.allow_msbuild {
+            eprintln!(
+                "{blue}[cplt]{nc}    MSBuild:       {yellow}allowed{nc}     {dim}MSBuild<pid> sockets (--allow-msbuild){nc}"
             );
         }
         if self.allow_browser {
@@ -1040,6 +1053,9 @@ impl Resolved {
         }
         if repo_config.propose.allow_dcp == Some(true) && is_approved("allow_dcp") {
             self.allow_dcp = true;
+        }
+        if repo_config.propose.allow_msbuild == Some(true) && is_approved("allow_msbuild") {
+            self.allow_msbuild = true;
         }
         if repo_config.propose.gradle_init == Some(true) && is_approved("gradle_init") {
             self.gradle_init = true;
