@@ -365,6 +365,16 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     #[arg(long)]
     allow_jvm_attach: bool,
 
+    /// Allow executing .NET Aspire's `dcp` orchestrator binary.
+    /// Needed for `dotnet run` on an Aspire AppHost project: DCP is a
+    /// Kubernetes-API-compatible orchestrator shipped as a native executable
+    /// inside the `Aspire.Hosting.Orchestration.<rid>` NuGet package. This
+    /// only allows exec of that specific `dcp` binary path (read-only) — the
+    /// AppHost's loopback connection to DCP's API server additionally
+    /// requires --allow-localhost-any, since DCP binds a random port each run.
+    #[arg(long)]
+    allow_dcp: bool,
+
     /// Allow Docker/Colima/OrbStack access inside the sandbox (DANGEROUS).
     #[arg(
         long,
@@ -1282,6 +1292,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         allow_gpg_signing: cli.allow_gpg_signing,
         deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
+        allow_dcp: cli.allow_dcp,
         // Config-only opt-in; no CLI flag.
         gradle_init: false,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
@@ -2306,6 +2317,16 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, &home_dir));
 
+    // Discover a relocated NuGet global-packages folder for --allow-dcp
+    // (.NET Aspire's `dcp` binary). The default ~/.nuget/packages location is
+    // already covered by HOME_TOOL_DIRS; this only matters when NUGET_PACKAGES
+    // points somewhere else.
+    let nuget_packages_dir = std::env::var("NUGET_PACKAGES")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
+
     // Compute agent-specific sandbox directories
     let agent_dirs = active_agent.config_dirs(&home_dir);
 
@@ -2363,11 +2384,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: copilot_install_dir.as_deref(),
         java_home: java_home_dir.as_deref(),
+        nuget_packages: nuget_packages_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_dcp: resolved.allow_dcp,
         allow_docker: resolved.allow_docker,
         electron_app_dir: electron_app_dir.as_deref(),
         agent: active_agent,
@@ -2812,6 +2835,11 @@ fn prepare_shell_sandbox(
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, home_dir));
+    let nuget_packages_dir = std::env::var("NUGET_PACKAGES")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, home_dir));
 
     let agent_dirs = active_agent.config_dirs(home_dir);
     for dir in &agent_dirs {
@@ -2858,11 +2886,13 @@ fn prepare_shell_sandbox(
         // shell/check have no agent install dir to grant special access to
         copilot_install_dir: None,
         java_home: java_home_dir.as_deref(),
+        nuget_packages: nuget_packages_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_dcp: resolved.allow_dcp,
         allow_docker: resolved.allow_docker,
         electron_app_dir: None,
         agent: active_agent,

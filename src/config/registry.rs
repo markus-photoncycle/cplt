@@ -326,6 +326,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_dcp",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Allow executing .NET Aspire's `dcp` orchestrator binary (Aspire.Hosting.Orchestration.<rid> NuGet package). Needed for `dotnet run` on an Aspire AppHost project; also requires allow_localhost_any for the AppHost↔DCP loopback connection.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "gradle_init",
         value_type: ConfigValueType::Bool,
         dangerous: false,

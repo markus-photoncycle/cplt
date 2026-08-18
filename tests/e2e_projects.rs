@@ -2478,4 +2478,155 @@ fi
         assert_result_ok(&stdout, "tcp_ipv6_bind");
         assert_result_ok(&stdout, "tcp_wildcard_bind");
     }
+
+    // ============================================================
+    // .NET Aspire DCP orchestrator (--allow-dcp)
+    // ============================================================
+
+    /// Find a real, already-installed `dcp` binary (from the
+    /// `Aspire.Hosting.Orchestration.<rid>` NuGet package) on this machine, and
+    /// the "packages root" directory it was resolved under.
+    ///
+    /// Scans the conventional default (`~/.nuget/packages`), the ambient
+    /// `NUGET_PACKAGES` override if set, and `~/.dotnet/.nuget/packages` (a
+    /// relocated global-packages folder some dotnet installs use) — covering
+    /// both code paths `--allow-dcp` exercises (the always-on default-home
+    /// carve-out, and the opt-in custom-root carve-out). Returns `None` if no
+    /// Aspire orchestration package is present; tests skip in that case rather
+    /// than requiring every dev/CI machine to have used Aspire before.
+    fn find_real_dcp_install() -> Option<(PathBuf, PathBuf)> {
+        let home = std::env::var("HOME").ok()?;
+        let mut roots = vec![
+            PathBuf::from(&home).join(".nuget/packages"),
+            PathBuf::from(&home).join(".dotnet/.nuget/packages"),
+        ];
+        if let Ok(p) = std::env::var("NUGET_PACKAGES") {
+            roots.push(PathBuf::from(p));
+        }
+
+        for root in roots {
+            let Ok(entries) = fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !name.starts_with("aspire.hosting.orchestration") {
+                    continue;
+                }
+                let Ok(versions) = fs::read_dir(entry.path()) else {
+                    continue;
+                };
+                for version in versions.flatten() {
+                    let dcp = version.path().join("tools/dcp");
+                    if dcp.is_file() {
+                        return Some((dcp, root));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Script that execs an absolute path to the real `dcp` binary with
+    /// `--help` — a safe, side-effect-free invocation that only prints usage
+    /// and exits 0. Distinguishes a sandbox exec denial from any other failure
+    /// the same way the MSBuild-style tests do, so a CI failure shows exactly
+    /// what went wrong instead of just "not OK".
+    fn script_dcp_help(dcp_bin: &Path) -> String {
+        format!(
+            r#"
+DCP_BIN="{dcp_bin}"
+if OUTPUT=$("$DCP_BIN" --help 2>&1); then
+    case "$OUTPUT" in
+        *"DCP is a developer tool"*)
+            echo "RESULT:dcp_exec:OK"
+            ;;
+        *)
+            echo "RESULT:dcp_exec:FAIL:unexpected_output"
+            echo "DCP_OUTPUT: $OUTPUT" >&2
+            ;;
+    esac
+else
+    echo "DCP_ERROR: $OUTPUT" >&2
+    case "$OUTPUT" in
+        *"Operation not permitted"*|*"not permitted"*|*"Permission denied"*)
+            echo "RESULT:dcp_exec:FAIL:sandbox_deny"
+            ;;
+        *)
+            echo "RESULT:dcp_exec:FAIL:other_error"
+            ;;
+    esac
+fi
+"#,
+            dcp_bin = dcp_bin.display(),
+        )
+    }
+
+    #[test]
+    fn project_dcp_exec_denied_without_allow_dcp() {
+        require_sandbox!();
+        let Some((dcp_bin, _)) = find_real_dcp_install() else {
+            eprintln!("SKIPPED: no Aspire.Hosting.Orchestration package (dcp binary) found");
+            return;
+        };
+
+        let project = TempProject::scaffold_node();
+        let script = script_dcp_help(&dcp_bin);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("RESULT:dcp_exec:FAIL:sandbox_deny"),
+            "Without --allow-dcp, exec of the dcp binary must be denied by the sandbox.\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn project_dcp_exec_works_with_allow_dcp() {
+        require_sandbox!();
+        let Some((dcp_bin, packages_root)) = find_real_dcp_install() else {
+            eprintln!("SKIPPED: no Aspire.Hosting.Orchestration package (dcp binary) found");
+            return;
+        };
+
+        let project = TempProject::scaffold_node();
+        let script = script_dcp_help(&dcp_bin);
+        let fake_dir = create_fake_copilot(&project, &script);
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let default_root = Path::new(&home).join(".nuget/packages");
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let mut cmd = Command::new(binary_path());
+        cmd.args(["--yes", "--no-validate", "--allow-dcp"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--", "--version"])
+            .env("PATH", &new_path);
+        // Only the default `~/.nuget/packages` location is covered without extra
+        // configuration. When `dcp` was actually resolved from a relocated
+        // packages folder (e.g. `~/.dotnet/.nuget/packages`), set NUGET_PACKAGES
+        // so cplt's discovery grants that root too — exercising the same code
+        // path a real Aspire dev's environment would need for restore to work.
+        if packages_root != default_root {
+            cmd.env("NUGET_PACKAGES", &packages_root);
+        }
+        let output = cmd.output().expect("cplt should run");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(
+            output.status.success(),
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("RESULT:dcp_exec:OK"),
+            "With --allow-dcp, exec of the dcp binary must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }

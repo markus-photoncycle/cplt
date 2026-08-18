@@ -65,6 +65,10 @@ pub struct ProfileOptions<'a> {
     /// Needed when Java is installed outside TOOL_READ_DIRS (e.g. ~/hostedtoolcache,
     /// sdkman, or other version managers).
     pub java_home: Option<&'a Path>,
+    /// NUGET_PACKAGES directory for read + dylib loading, when the global
+    /// packages folder is relocated outside `~/.nuget/packages` (the default
+    /// location is already covered by `HOME_TOOL_DIRS`).
+    pub nuget_packages: Option<&'a Path>,
     /// Global git hooks directory from `core.hooksPath`.
     /// Git needs to read and execute hooks from this directory for commits.
     pub git_hooks_path: Option<&'a Path>,
@@ -86,6 +90,12 @@ pub struct ProfileOptions<'a> {
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
+    /// Allow executing the .NET Aspire DCP orchestrator (`dcp` binary shipped
+    /// in the `Aspire.Hosting.Orchestration.<rid>` NuGet package). The
+    /// AppHost↔DCP loopback API-server connection additionally requires
+    /// `allow_localhost_any` — kept separate so it stays independently
+    /// reviewable in `.cplt.toml` propose blocks.
+    pub allow_dcp: bool,
     /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
     pub allow_docker: bool,
     /// Electron app bundle Contents directory (e.g., VS Code .app/Contents).
@@ -159,6 +169,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     );
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
     emit_java_home(&mut sb, opts.java_home);
+    emit_dcp(&mut sb, &home, opts.nuget_packages, opts.allow_dcp);
     emit_electron_app(&mut sb, opts.electron_app_dir);
     emit_system_files(&mut sb);
     emit_temp_rules(
@@ -792,6 +803,99 @@ fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
     }
 }
 
+/// Escape a literal string for safe interpolation into an SBPL regex
+/// (POSIX-ERE-like) pattern, so a path containing metacharacters can't
+/// widen or break out of an anchored match.
+fn escape_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '+' | '*' | '?' | '[' | ']' | '^' | '$' | '(' | ')' | '{' | '}' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Allow executing .NET Aspire's `dcp` orchestrator binary, and read-only
+/// access to a relocated NUGET_PACKAGES global packages folder.
+///
+/// `dcp` ("Developer Control Plane") is a Kubernetes-API-compatible
+/// orchestrator shipped as a native executable inside the
+/// `Aspire.Hosting.Orchestration.<rid>` NuGet package (e.g.
+/// `aspire.hosting.orchestration.osx-arm64`), landing under
+/// `<packages-root>/aspire.hosting.orchestration.<rid>/<version>/tools/dcp`.
+/// The AppHost process (`dotnet run` on an Aspire AppHost project) execs it
+/// directly to stand up a local API server the AppHost then talks to like a
+/// real Kubernetes cluster.
+///
+/// `.nuget` is a writable dependency store (`HOME_TOOL_DIRS`, write: true,
+/// process_exec: false) — deliberately non-executable to block a rogue agent
+/// from trojaning a downloaded package and running it. This carve-out
+/// re-allows exec narrowly for the `dcp` binary's install path only (any
+/// RID/version), the same read-only pattern used for other trusted-installer
+/// binaries elsewhere in this file, and denies writes to that exact path so
+/// it can't be replaced with a malicious binary after the fact.
+///
+/// Does NOT grant the loopback TCP connection the AppHost needs to reach
+/// DCP's (randomly-ephemeral-ported) API server — that requires
+/// `allow_localhost_any`, kept as a separate opt-in.
+fn emit_dcp(sb: &mut String, home: &str, nuget_packages: Option<&Path>, allow_dcp: bool) {
+    if !allow_dcp {
+        return;
+    }
+    sbpl!(
+        sb,
+        ";; .NET Aspire DCP orchestrator — exec the `dcp` binary only (--allow-dcp)"
+    );
+    // The Aspire AppHost template always sets a per-project UserSecretsId and
+    // reads `~/.microsoft/usersecrets/<id>/secrets.json` during host-builder
+    // startup, before DCP is ever launched — `dotnet run` on an AppHost fails
+    // here first if this is denied. Read-only; the ID is an opaque per-project
+    // GUID cplt has no way to discover without parsing the .csproj, so this
+    // grants the whole tree rather than one project's secrets file, same
+    // trade-off as `.gitconfig`-adjacent tool config dirs elsewhere in this
+    // file. NOTE: exposes user secrets for every local .NET project, not just
+    // this one — that's the reason it's gated behind --allow-dcp rather than
+    // granted unconditionally.
+    sbpl!(
+        sb,
+        "(allow file-read* (subpath \"{home}/.microsoft/usersecrets\"))"
+    );
+    // Default global packages folder: {home}/.nuget/packages/<package>/<version>/tools/dcp
+    emit_dcp_exec_carveout(sb, &format!("{}/\\.nuget/packages", escape_regex(home)));
+    if let Some(dir) = nuget_packages {
+        let p = dir.to_string_lossy();
+        sbpl!(
+            sb,
+            ";; NUGET_PACKAGES — relocated global packages folder read + dylib loading"
+        );
+        sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+        // NUGET_PACKAGES points directly at the packages folder itself:
+        // <NUGET_PACKAGES>/<package>/<version>/tools/dcp
+        emit_dcp_exec_carveout(sb, &escape_regex(&p));
+    }
+    sbpl!(sb);
+}
+
+/// Emit the anchored process-exec allow + file-write deny for `dcp` under an
+/// already-regex-escaped `packages_root` (e.g. `{home}/.nuget/packages` or a
+/// custom NUGET_PACKAGES root).
+///
+/// SECURITY: regex is anchored with `^`/`$`; the RID and version segments use
+/// `[^/]+` (not `.+`) so the match can't cross a `/` boundary into a sibling
+/// package or an unrelated deeper path.
+fn emit_dcp_exec_carveout(sb: &mut String, packages_root: &str) {
+    let pattern =
+        format!("^{packages_root}/aspire\\.hosting\\.orchestration\\.[^/]+/[^/]+/tools/dcp$");
+    sbpl!(sb, "(allow process-exec (regex #\"{pattern}\"))");
+    sbpl!(sb, "(deny file-write* (regex #\"{pattern}\"))");
+}
+
 /// Allow reading and loading shared libraries from an Electron app bundle.
 /// Needed when Copilot CLI uses VS Code's (or similar editor's) Electron as its
 /// Node.js runtime — dyld must load `Electron Framework.framework` from within
@@ -1400,11 +1504,13 @@ mod tests {
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
+            nuget_packages: None,
             git_hooks_path: None,
             git_common_dir: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
+            allow_dcp: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: crate::agent::Agent::Copilot,

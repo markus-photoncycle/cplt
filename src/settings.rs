@@ -537,6 +537,7 @@ fn resolved_values(
                 ("sandbox", "quiet") => resolved.quiet.to_string(),
                 ("sandbox", "yes") => resolved.yes.to_string(),
                 ("sandbox", "allow_jvm_attach") => resolved.allow_jvm_attach.to_string(),
+                ("sandbox", "allow_dcp") => resolved.allow_dcp.to_string(),
                 ("sandbox", "allow_docker") => resolved.allow_docker.to_string(),
                 ("sandbox", "allow_cache_exec") => format_strings(&resolved.allow_cache_exec),
                 ("sandbox", "allow_cache_exec_any") => resolved.allow_cache_exec_any.to_string(),

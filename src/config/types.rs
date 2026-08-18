@@ -592,6 +592,11 @@ pub struct SandboxConfig {
     /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     pub allow_jvm_attach: Option<bool>,
+    /// Allow executing .NET Aspire's `dcp` orchestrator binary (default: false).
+    /// Needed for `dotnet run` on an Aspire AppHost project. The AppHost↔DCP
+    /// loopback API-server connection additionally requires
+    /// `allow_localhost_any` (DCP binds an ephemeral port each run).
+    pub allow_dcp: Option<bool>,
     /// Install a cplt-managed Gradle init script in the Gradle user home
     /// (`$GRADLE_USER_HOME/init.d/` or `~/.gradle/init.d/`) that applies the
     /// preferIPv4Stack workaround inside the sandbox (default: false).
@@ -754,6 +759,7 @@ pub struct Resolved {
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
+    pub allow_dcp: bool,
     pub gradle_init: bool,
     pub allow_docker: bool,
     pub allow_tmp_exec: bool,
@@ -825,6 +831,7 @@ pub struct CliFlags {
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
+    pub allow_dcp: bool,
     pub gradle_init: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_docker: FeatureToggle,
