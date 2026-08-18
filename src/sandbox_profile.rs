@@ -874,6 +874,48 @@ fn emit_dcp(sb: &mut String, home: &str, nuget_packages: Option<&Path>, allow_dc
         sb,
         "(allow file-read* (subpath \"{home}/.microsoft/usersecrets\"))"
     );
+    // DCP's own persistent state store (a local Kubernetes-object-store cache,
+    // analogous to etcd's data dir for a real cluster) lives at
+    // `~/.dcp/state`. On startup DCP chmods this directory to restrict its
+    // permissions; without write access here that chmod is denied, DCP's
+    // controller-host exits(1) right after its API server comes up, and every
+    // subsequent AppHost watch connection then fails with a stream error
+    // (nothing is listening anymore) rather than a clear permission error —
+    // this is the single most confusing failure mode in the whole feature.
+    // No exec: it's just data files, not something DCP or the AppHost execs.
+    sbpl!(sb, "(allow file-read* (subpath \"{home}/.dcp\"))");
+    sbpl!(sb, "(allow file-write* (subpath \"{home}/.dcp\"))");
+    // DCP's "notify socket" — used to push resource-lifecycle notifications
+    // to a controller process — binds a Unix socket at a randomly-suffixed
+    // path under `~/Library/Caches/dcp-work/`. Non-fatal if denied (DCP logs
+    // "Notifications will not be sent to controller process" and continues),
+    // but there's no reason to leave it broken now that the pattern is known.
+    // SECURITY: regex anchored with ^/$; `[^/]+` (not `.+`) keeps the match
+    // to a single path segment so it can't cross into an unrelated deeper path.
+    sbpl!(
+        sb,
+        "(allow file-read* (subpath \"{home}/Library/Caches/dcp-work\"))"
+    );
+    sbpl!(
+        sb,
+        "(allow file-write* (subpath \"{home}/Library/Caches/dcp-work\"))"
+    );
+    let notify_sock_pattern = format!(
+        "^{}/Library/Caches/dcp-work/dcp-notify-sock-[^/]+$",
+        escape_regex(home)
+    );
+    sbpl!(
+        sb,
+        "(allow network-bind (local unix-socket (regex #\"{notify_sock_pattern}\")))"
+    );
+    sbpl!(
+        sb,
+        "(allow network-inbound (local unix-socket (regex #\"{notify_sock_pattern}\")))"
+    );
+    sbpl!(
+        sb,
+        "(allow network-outbound (remote unix-socket (regex #\"{notify_sock_pattern}\")))"
+    );
     // Default global packages folder: {home}/.nuget/packages/<package>/<version>/tools/dcp
     emit_dcp_exec_carveout(sb, &format!("{}/\\.nuget/packages", escape_regex(home)));
     // Second well-known default: {home}/.dotnet/.nuget/packages. NuGet's global

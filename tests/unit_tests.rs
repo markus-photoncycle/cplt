@@ -2847,6 +2847,27 @@ fn profile_allows_dcp_when_flag_set() {
         !p.contains("NUGET_PACKAGES"),
         "Must not emit a NUGET_PACKAGES section when none was discovered"
     );
+    // DCP's own persistent state store (~/.dcp/state) needs write access, or
+    // DCP's startup chmod fails and it exits(1) right after its API server
+    // comes up — the most confusing failure mode in the whole feature.
+    assert!(
+        p.contains("(allow file-write* (subpath \"/Users/test/.dcp\"))"),
+        "Must allow write access to ~/.dcp for DCP's persistent state store"
+    );
+    // DCP's notify-socket (non-fatal if missing, but should still work).
+    let notify_pattern = "^/Users/test/Library/Caches/dcp-work/dcp-notify-sock-[^/]+$";
+    assert!(
+        p.contains(&format!(
+            "(allow network-bind (local unix-socket (regex #\"{notify_pattern}\")))"
+        )),
+        "Must allow binding the DCP notify socket"
+    );
+    assert!(
+        p.contains(&format!(
+            "(allow network-outbound (remote unix-socket (regex #\"{notify_pattern}\")))"
+        )),
+        "Must allow connecting to the DCP notify socket"
+    );
 }
 
 #[test]
