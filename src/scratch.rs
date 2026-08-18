@@ -13,7 +13,12 @@
 //! - macOS: `~/Library/Caches/cplt/tmp/{session-id}/`
 //! - Linux: `~/.cache/cplt/tmp/{session-id}/`
 //!
-//! Each session gets a UUID subdirectory for isolation.
+//! Each session gets a randomly-named subdirectory for isolation. The name is
+//! kept short (16 hex chars / 64 bits — see `generate_session_id`) rather than
+//! a full UUID: tools that create Unix domain sockets under `$TMPDIR` (e.g.
+//! .NET Aspire's DCP orchestrator) are subject to the platform's ~104-byte
+//! `sun_path` limit, and a long session id combined with `~/Library/Caches`'s
+//! own path length can push a deeply-nested socket path over that limit.
 
 use crate::sandbox::validate_sbpl_path;
 use crate::ui;
@@ -167,9 +172,18 @@ impl Drop for ScratchDir {
     }
 }
 
+/// Number of random bytes in a session id (16 hex chars = 64 bits). Kept
+/// short — not a full 128-bit UUID — because the id sits in the middle of
+/// paths that downstream tools build Unix domain sockets under, which are
+/// capped at ~104 bytes total (see module docs). 64 bits of entropy is still
+/// far more than enough to avoid collisions for a per-machine, 24h-GC'd temp
+/// dir (`DirBuilder::create` fails outright on collision — see `create()` —
+/// so this needs to be collision-safe, not just collision-resistant).
+const SESSION_ID_BYTES: usize = 8;
+
 /// Generate a random session ID using /dev/urandom.
 fn generate_session_id() -> String {
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; SESSION_ID_BYTES];
     let got_random = std::fs::File::open("/dev/urandom")
         .and_then(|mut f| {
             use std::io::Read;
@@ -178,21 +192,26 @@ fn generate_session_id() -> String {
         .is_ok();
 
     if !got_random {
-        // Fallback: use PID + timestamp for uniqueness
+        // Fallback: use PID + truncated timestamp for uniqueness.
         let pid = std::process::id();
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos();
+            .as_nanos() as u32;
         buf[0..4].copy_from_slice(&pid.to_le_bytes());
-        buf[4..].copy_from_slice(&ts.to_le_bytes()[..12]);
+        buf[4..8].copy_from_slice(&ts.to_le_bytes());
     }
     hex_encode(&buf)
 }
 
-/// Check if a string looks like one of our session IDs (32-char hex).
+/// Check if a string looks like one of our session IDs: all-hex, and within
+/// the range of lengths cplt has ever generated. Deliberately a range (not an
+/// exact match on the current `SESSION_ID_BYTES`) so `gc_stale()` still
+/// cleans up dirs left behind by older cplt versions that used a longer id
+/// (previously 32 hex chars / 128 bits) — this base directory is exclusively
+/// cplt's own, so any hex-named entry in it is safe to treat as ours.
 fn is_session_id(name: &str) -> bool {
-    name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit())
+    (SESSION_ID_BYTES * 2..=32).contains(&name.len()) && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Validate that a directory is safe to use as scratch base.
@@ -265,14 +284,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn session_id_is_32_hex_chars() {
+    fn session_id_is_16_hex_chars() {
         let id = generate_session_id();
-        assert_eq!(id.len(), 32);
+        assert_eq!(id.len(), SESSION_ID_BYTES * 2);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn is_session_id_accepts_valid() {
+        // Current format (16 hex chars / 64 bits).
+        assert!(is_session_id("0123456789abcdef"));
+        assert!(is_session_id("AABBCCDD00112233"));
+        // Legacy format (32 hex chars / 128 bits) — gc_stale() must still
+        // recognize and clean up dirs left behind by older cplt versions.
         assert!(is_session_id("0123456789abcdef0123456789abcdef"));
         assert!(is_session_id("AABBCCDD00112233AABBCCDD00112233"));
     }
@@ -280,9 +304,9 @@ mod tests {
     #[test]
     fn is_session_id_rejects_invalid() {
         assert!(!is_session_id("too-short"));
-        assert!(!is_session_id("0123456789abcdef0123456789abcde")); // 31 chars
-        assert!(!is_session_id("0123456789abcdef0123456789abcdefg")); // 33 chars
-        assert!(!is_session_id("0123456789abcdef0123456789abcdeg")); // non-hex
+        assert!(!is_session_id("0123456789abcde")); // 15 chars — below SESSION_ID_BYTES*2
+        assert!(!is_session_id("0123456789abcdef0123456789abcdefg")); // 33 chars — above legacy len
+        assert!(!is_session_id("0123456789abcdeg")); // non-hex
     }
 
     #[test]

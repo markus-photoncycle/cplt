@@ -876,6 +876,23 @@ fn emit_dcp(sb: &mut String, home: &str, nuget_packages: Option<&Path>, allow_dc
     );
     // Default global packages folder: {home}/.nuget/packages/<package>/<version>/tools/dcp
     emit_dcp_exec_carveout(sb, &format!("{}/\\.nuget/packages", escape_regex(home)));
+    // Second well-known default: {home}/.dotnet/.nuget/packages. NuGet's global
+    // packages folder location is baked into a project's generated
+    // *.csproj.nuget.g.props (NuGetPackageRoot) at restore time and persists
+    // there — it does NOT re-derive from the current shell's NUGET_PACKAGES
+    // env var on every build. A project restored once with a relocated
+    // packages folder (e.g. by a GUI IDE launched via launchd, a since-removed
+    // shell rc export, or any other restore-time-only mechanism) keeps using
+    // that path indefinitely, even in a shell session where NUGET_PACKAGES was
+    // never set — so relying solely on the `nuget_packages` env-var discovery
+    // below misses this common real-world case. `~/.dotnet/.nuget/packages` in
+    // particular shows up whenever DOTNET_CLI_HOME/DOTNET_ROOT point at
+    // `~/.dotnet` (a common dotnet-install.sh convention), so it's treated as
+    // a second default rather than requiring the env var to still be set.
+    emit_dcp_exec_carveout(
+        sb,
+        &format!("{}/\\.dotnet/\\.nuget/packages", escape_regex(home)),
+    );
     if let Some(dir) = nuget_packages {
         let p = dir.to_string_lossy();
         sbpl!(
