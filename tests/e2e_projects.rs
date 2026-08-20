@@ -200,6 +200,88 @@ mod project_tests {
             p
         }
 
+        /// Minimal Aspire AppHost + xunit test project, self-contained (no
+        /// dependency on any private/customer repo). Exercises the exact
+        /// combination `--allow-dcp` exists for: Aspire's DCP orchestrator
+        /// spinning up a real Postgres container (via
+        /// `Aspire.Hosting.PostgreSQL`, itself Testcontainers-backed) and a
+        /// `dotnet test` run whose vstest.console<->testhost IPC must survive
+        /// the sandbox network policy.
+        fn scaffold_aspire_dcp() -> Self {
+            let p = Self::new("aspire-dcp");
+            p.write_file(
+                "AppHost/AppHost.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk">
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.4.6" />
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsAspireHost>true</IsAspireHost>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.4.6" />
+    <PackageReference Include="Aspire.Hosting.PostgreSQL" Version="13.4.6" />
+  </ItemGroup>
+</Project>
+"#,
+            );
+            p.write_file(
+                "AppHost/Program.cs",
+                "var builder = DistributedApplication.CreateBuilder(args);\nbuilder.AddPostgres(\"postgres\");\nbuilder.Build().Run();\n",
+            );
+            p.write_file(
+                "Tests/Tests.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Testing" Version="13.4.6" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../AppHost/AppHost.csproj" />
+  </ItemGroup>
+</Project>
+"#,
+            );
+            p.write_file(
+                "Tests/DcpSmokeTests.cs",
+                r#"using Aspire.Hosting.Testing;
+using Xunit;
+
+namespace Fixture.Tests;
+
+public class DcpSmokeTests
+{
+    [Fact]
+    public async Task Postgres_container_starts_via_dcp_and_becomes_healthy()
+    {
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AppHost>();
+        await using var app = await appHost.BuildAsync();
+        await app.StartAsync();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        await app.ResourceNotifications.WaitForResourceHealthyAsync("postgres", cts.Token);
+
+        Console.WriteLine("RESULT:dcp_postgres_healthy:OK");
+    }
+}
+"#,
+            );
+            p.write_file("README.md", "# Aspire DCP fixture\n");
+            p.write_file(".gitignore", "bin/\nobj/\n");
+            p.git_init();
+            p
+        }
+
         fn scaffold_python() -> Self {
             let p = Self::new("python");
             p.write_file("requirements.txt", "flask==3.0.0\nrequests==2.31.0\n");
@@ -1609,6 +1691,172 @@ finally:
             stdout.contains("BLOCKED"),
             "MSBuild socket must be blocked without --allow-msbuild, got: {stdout}"
         );
+    }
+
+    // ============================================================
+    // Aspire DCP tests
+    // ============================================================
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .arg("info")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end: Aspire's DCP orchestrator starts a real Postgres container
+    /// (Testcontainers-backed under the hood) and `dotnet test`'s own
+    /// vstest.console<->testhost IPC survives, inside the sandbox.
+    ///
+    /// This is the fixture-based regression test for two distinct bugs found
+    /// via a real customer Aspire integration-test suite (not reproducible
+    /// here, hence this self-contained fixture):
+    ///   1. DCP's api-server binds IPv6-only on loopback — anything that
+    ///      disables IPv6 (e.g. `DOTNET_SYSTEM_NET_DISABLEIPV6=1`) breaks it
+    ///      identically with or without cplt. Not a sandbox issue; this test
+    ///      just also guards against a future regression that reintroduces
+    ///      the env var into the default pass-through allowlist.
+    ///   2. `(deny network-outbound (remote tcp))` followed by ANY
+    ///      host-scoped allow (`remote ip "localhost:*"`, `remote tcp
+    ///      "localhost:*"`, even a `require-all` combining both) silently
+    ///      breaks .NET's non-blocking Socket connect on this macOS release —
+    ///      confirmed via minimal single-line diffs, independent of profile
+    ///      size. Only a fully unrestricted `(allow network-outbound)` works;
+    ///      no SBPL host filter does (`*`/`localhost` are the only accepted
+    ///      host tokens — literal IPs are hard-rejected by the parser).
+    ///      `emit_network_rules` now drops the outbound restriction when
+    ///      `--allow-dcp` + `--allow-localhost-any` are both set.
+    #[test]
+    fn project_dotnet_aspire_dcp_testcontainer_works_with_allow_dcp() {
+        require_sandbox!();
+        match dotnet_availability() {
+            DotnetAvailability::Missing => {
+                eprintln!("SKIPPED: dotnet not available");
+                return;
+            }
+            DotnetAvailability::TooOld(found) => {
+                eprintln!(
+                    "SKIPPED: dotnet {found} found, but the fixture targets net8.0 \
+                     (requires SDK major version >= 8)"
+                );
+                return;
+            }
+            DotnetAvailability::Available => {}
+        }
+        if !docker_available() {
+            eprintln!("SKIPPED: docker not available (Aspire's Postgres resource needs it)");
+            return;
+        }
+
+        let project = TempProject::scaffold_aspire_dcp();
+        let script = r#"
+if TEST_OUTPUT=$(env -u DOTNET_SYSTEM_NET_DISABLEIPV6 dotnet test Tests/Tests.csproj --nologo 2>&1); then
+    case "$TEST_OUTPUT" in
+        *"Passed!"*)
+            echo "RESULT:dcp_testcontainer:OK"
+            ;;
+        *)
+            echo "TEST_ERROR: $TEST_OUTPUT" >&2
+            echo "RESULT:dcp_testcontainer:FAIL:no_pass_marker"
+            ;;
+    esac
+else
+    echo "TEST_ERROR: $TEST_OUTPUT" >&2
+    case "$TEST_OUTPUT" in
+        *"Operation not permitted"*|*"not permitted"*|*"Permission denied"*)
+            echo "RESULT:dcp_testcontainer:FAIL:sandbox_deny"
+            ;;
+        *"failed to connect to testhost"*)
+            echo "RESULT:dcp_testcontainer:FAIL:vstest_hang"
+            ;;
+        *)
+            echo "RESULT:dcp_testcontainer:FAIL:other"
+            ;;
+    esac
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &[
+                "--allow-dcp",
+                "--allow-docker",
+                "--allow-localhost-any",
+                "--allow-msbuild",
+            ],
+        );
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "dcp_testcontainer");
+    }
+
+    /// Without `--allow-dcp`, the sandbox's default network policy is
+    /// unchanged — `dotnet test`'s vstest.console<->testhost IPC still hangs
+    /// on this macOS release, exactly as it did before `--allow-dcp` existed.
+    /// Proves the `emit_network_rules` relaxation is properly gated behind
+    /// the flag rather than a silent global behavior change.
+    ///
+    /// `VSTEST_CONNECTION_TIMEOUT` is shortened so this doesn't cost the full
+    /// default 90s per run; the underlying hang is deterministic on this
+    /// platform (not a slow-but-eventually-succeeds case — verified separately
+    /// against the full 90s and even a 300s timeout).
+    #[test]
+    fn project_dotnet_aspire_dcp_blocked_without_allow_dcp() {
+        require_sandbox!();
+        match dotnet_availability() {
+            DotnetAvailability::Missing => {
+                eprintln!("SKIPPED: dotnet not available");
+                return;
+            }
+            DotnetAvailability::TooOld(found) => {
+                eprintln!(
+                    "SKIPPED: dotnet {found} found, but the fixture targets net8.0 \
+                     (requires SDK major version >= 8)"
+                );
+                return;
+            }
+            DotnetAvailability::Available => {}
+        }
+        if !docker_available() {
+            eprintln!("SKIPPED: docker not available");
+            return;
+        }
+
+        let project = TempProject::scaffold_aspire_dcp();
+        let script = r#"
+export VSTEST_CONNECTION_TIMEOUT=15
+if TEST_OUTPUT=$(env -u DOTNET_SYSTEM_NET_DISABLEIPV6 dotnet test Tests/Tests.csproj --nologo 2>&1); then
+    echo "TEST_OUTPUT: $TEST_OUTPUT" >&2
+    echo "RESULT:dcp_gated:FAIL:unexpectedly_passed_without_allow_dcp"
+else
+    case "$TEST_OUTPUT" in
+        *"failed to connect to testhost"*)
+            echo "RESULT:dcp_gated:OK:still_hangs_as_expected"
+            ;;
+        *)
+            echo "TEST_OUTPUT: $TEST_OUTPUT" >&2
+            echo "RESULT:dcp_gated:OK:failed_some_other_way"
+            ;;
+    esac
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &["--allow-docker", "--allow-localhost-any", "--allow-msbuild"],
+        );
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "dcp_gated");
     }
 
     // ============================================================

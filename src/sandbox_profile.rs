@@ -203,6 +203,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.proxy_port,
         opts.localhost_ports,
         opts.proxy_forced,
+        opts.allow_dcp,
     );
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
@@ -1504,6 +1505,7 @@ fn emit_network_rules(
     proxy_port: Option<u16>,
     localhost_ports: &[u16],
     proxy_forced: bool,
+    allow_dcp: bool,
 ) {
     // Network — outbound restricted to HTTPS/HTTP, localhost blocked by default.
     // Copilot CLI connects directly to api.githubcopilot.com:443 etc.
@@ -1518,56 +1520,85 @@ fn emit_network_rules(
         "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
     );
 
-    // Outbound TCP restricted to port 443 (HTTPS only).
-    // All Copilot/GitHub APIs use HTTPS — port 80 is not needed and would
-    // allow unencrypted exfiltration. Use --allow-port 80 if required.
-    sbpl!(sb, "(deny network-outbound (remote tcp))");
-    // Proxy-forced mode (#53): do NOT allow direct egress to `*:443`. Instead
-    // the only outbound allowance is `localhost:{proxy_port}`, emitted below with
-    // the other localhost carve-outs. Unlike Landlock (port-based), SBPL CAN pin
-    // to localhost, so this gives macOS FULL enforcement with no residual: a
-    // direct connect to any remote host on :443 is denied and all HTTPS must go
-    // through the CONNECT proxy, defeating the `env -u HTTPS_PROXY` bypass.
+    // --allow-dcp + --allow-localhost-any: drop the outbound TCP restriction
+    // entirely instead of the usual port/host-scoped rules below.
     //
-    // Fail closed: if `proxy_forced` is set but `proxy_port` is None (a
-    // contradiction the orchestration already prevents), we emit NO outbound-443
-    // rule and NO localhost proxy carve-out — the deny-by-default profile then
-    // blocks all remote TCP, which is the safe failure rather than an open one.
-    if !proxy_forced {
-        sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
-    }
-
-    // Extra ports (e.g., MCP servers, custom services)
-    for port in extra_ports {
-        sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
-    }
-
-    // Block localhost outbound — prevents SSRF to local dev servers, databases, etc.
-    // Must come AFTER port allows so it overrides them for localhost.
-    if allow_localhost_any {
-        // Allow all localhost ports. With -Djava.net.preferIPv4Stack=true injected
-        // via JAVA_TOOL_OPTIONS (macOS), Java connections stay as pure IPv4 and
-        // "localhost:*" matches correctly. No need for "*:*" anymore.
-        sbpl!(sb, "(allow network-outbound (remote ip \"localhost:*\"))");
+    // Root cause (isolated via minimal repro, independent of profile size):
+    // .NET's non-blocking Socket connect — used by BOTH Aspire's DCP watch
+    // connections and vstest.console<->testhost IPC — never completes under
+    // `(deny network-outbound (remote tcp))` followed by ANY host-scoped allow,
+    // even `(allow network-outbound (remote ip "localhost:*"))` or the
+    // same-filter-class `(allow network-outbound (remote tcp "localhost:*"))`.
+    // A plain curl/python TCP round-trip over the identical rules works fine —
+    // only .NET's async connect path hits this. Only a wholly unrestricted
+    // `(allow network-outbound)` reliably works; every host-scoped variant
+    // tried still hangs until the caller's own timeout gives up. This looks
+    // like an Apple Seatbelt limitation on this macOS release, not something
+    // expressible via SBPL host filters.
+    //
+    // --allow-dcp already execs an arbitrary orchestrator binary and grants
+    // broad ~/.dcp read/write access, so this trades the port/host outbound
+    // restriction for that same opt-in rather than leaving `dotnet run` /
+    // `dotnet test` permanently deadlocked for Aspire projects. Gated on
+    // `allow_localhost_any` too since DCP's loopback API server already
+    // requires it (see emit_dcp) — an --allow-dcp run without it isn't a
+    // complete DCP setup — and on `!proxy_forced` so proxy-forced mode's
+    // anti-bypass guarantee (all HTTPS through the CONNECT proxy) is never
+    // silently weakened.
+    if allow_dcp && allow_localhost_any && !proxy_forced {
+        sbpl!(sb, "(allow network-outbound)");
     } else {
-        // Defense-in-depth: the general `(deny network-outbound (remote tcp))` above
-        // already blocks all TCP. This adds explicit localhost deny for clarity.
-        sbpl!(sb, "(deny network-outbound (remote ip \"localhost:*\"))");
-    }
+        // Outbound TCP restricted to port 443 (HTTPS only).
+        // All Copilot/GitHub APIs use HTTPS — port 80 is not needed and would
+        // allow unencrypted exfiltration. Use --allow-port 80 if required.
+        sbpl!(sb, "(deny network-outbound (remote tcp))");
+        // Proxy-forced mode (#53): do NOT allow direct egress to `*:443`. Instead
+        // the only outbound allowance is `localhost:{proxy_port}`, emitted below with
+        // the other localhost carve-outs. Unlike Landlock (port-based), SBPL CAN pin
+        // to localhost, so this gives macOS FULL enforcement with no residual: a
+        // direct connect to any remote host on :443 is denied and all HTTPS must go
+        // through the CONNECT proxy, defeating the `env -u HTTPS_PROXY` bypass.
+        //
+        // Fail closed: if `proxy_forced` is set but `proxy_port` is None (a
+        // contradiction the orchestration already prevents), we emit NO outbound-443
+        // rule and NO localhost proxy carve-out — the deny-by-default profile then
+        // blocks all remote TCP, which is the safe failure rather than an open one.
+        if !proxy_forced {
+            sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
+        }
 
-    // Carve-outs for specific localhost ports (proxy, MCP servers, dev servers).
-    // These come AFTER the deny so they override it (last-match-wins in SBPL).
-    if let Some(port) = proxy_port {
-        sbpl!(
-            sb,
-            "(allow network-outbound (remote ip \"localhost:{port}\"))"
-        );
-    }
-    for port in localhost_ports {
-        sbpl!(
-            sb,
-            "(allow network-outbound (remote ip \"localhost:{port}\"))"
-        );
+        // Extra ports (e.g., MCP servers, custom services)
+        for port in extra_ports {
+            sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+        }
+
+        // Block localhost outbound — prevents SSRF to local dev servers, databases, etc.
+        // Must come AFTER port allows so it overrides them for localhost.
+        if allow_localhost_any {
+            // Allow all localhost ports. With -Djava.net.preferIPv4Stack=true injected
+            // via JAVA_TOOL_OPTIONS (macOS), Java connections stay as pure IPv4 and
+            // "localhost:*" matches correctly. No need for "*:*" anymore.
+            sbpl!(sb, "(allow network-outbound (remote ip \"localhost:*\"))");
+        } else {
+            // Defense-in-depth: the general `(deny network-outbound (remote tcp))` above
+            // already blocks all TCP. This adds explicit localhost deny for clarity.
+            sbpl!(sb, "(deny network-outbound (remote ip \"localhost:*\"))");
+        }
+
+        // Carve-outs for specific localhost ports (proxy, MCP servers, dev servers).
+        // These come AFTER the deny so they override it (last-match-wins in SBPL).
+        if let Some(port) = proxy_port {
+            sbpl!(
+                sb,
+                "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            );
+        }
+        for port in localhost_ports {
+            sbpl!(
+                sb,
+                "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            );
+        }
     }
 
     // Allow binding and accepting on localhost TCP ports.
