@@ -228,6 +228,21 @@ fn emit_header(sb: &mut String, project: &str) {
 
     sbpl!(sb, "(import \"/System/Library/Sandbox/Profiles/bsd.sb\")");
     sbpl!(sb);
+
+    // Unix-domain-socket connect() is gated by `network-outbound`, a
+    // completely separate operation from `file-read*`/`file-write*`. Denying
+    // read/write on a directory (e.g. ~/.ssh) does NOT stop a process from
+    // connect()-ing to a socket that lives inside it — and `lsof` can reveal
+    // such a socket's path without touching the filesystem at all, since it
+    // reads kernel process tables, not the denied directory. Without this,
+    // a sandboxed agent can locate and connect to e.g. a stale `ssh-agent`
+    // socket under ~/.ssh/agent/, bypassing both the ~/.ssh deny and the
+    // SSH_AUTH_SOCK env-strip entirely. Deny broadly here, first in the
+    // profile, so later emit_* calls can still re-allow specific sockets
+    // (Docker, Gradle/DCP/MSBuild daemons, gpg-agent, Chrome/Java debug,
+    // scratch dir, mDNSResponder) via SBPL's last-match-wins semantics.
+    sbpl!(sb, "(deny network-outbound (remote unix-socket))");
+    sbpl!(sb);
 }
 
 fn emit_process_rules(sb: &mut String) {
@@ -1526,15 +1541,23 @@ fn emit_network_rules(
     // Root cause (isolated via minimal repro, independent of profile size):
     // .NET's non-blocking Socket connect — used by BOTH Aspire's DCP watch
     // connections and vstest.console<->testhost IPC — never completes under
-    // `(deny network-outbound (remote tcp))` followed by ANY host-scoped allow,
-    // even `(allow network-outbound (remote ip "localhost:*"))` or the
+    // `(deny network-outbound (remote tcp))` followed by ANY *host-scoped*
+    // allow, even `(allow network-outbound (remote ip "localhost:*"))` or the
     // same-filter-class `(allow network-outbound (remote tcp "localhost:*"))`.
     // A plain curl/python TCP round-trip over the identical rules works fine —
-    // only .NET's async connect path hits this. Only a wholly unrestricted
-    // `(allow network-outbound)` reliably works; every host-scoped variant
-    // tried still hangs until the caller's own timeout gives up. This looks
-    // like an Apple Seatbelt limitation on this macOS release, not something
+    // only .NET's async connect path hits this. Dropping just the host/port
+    // filter — `(allow network-outbound (remote tcp))`, unscoped by host but
+    // still scoped to the TCP protocol filter class — reliably works; every
+    // *host*-scoped variant tried still hangs until the caller's own timeout
+    // gives up. This looks like an Apple Seatbelt limitation on this macOS
+    // release tied to the host-filter evaluation path, not something
     // expressible via SBPL host filters.
+    //
+    // Deliberately scoped to `(remote tcp)` and NOT a bare `(allow
+    // network-outbound)`: the latter also matches `(remote unix-socket)`,
+    // which would undo the broad unix-socket deny in `emit_header` (SBPL is
+    // last-match-wins) and reopen exactly the stale-ssh-agent-socket leak
+    // that deny exists to close.
     //
     // --allow-dcp already execs an arbitrary orchestrator binary and grants
     // broad ~/.dcp read/write access, so this trades the port/host outbound
@@ -1546,7 +1569,7 @@ fn emit_network_rules(
     // anti-bypass guarantee (all HTTPS through the CONNECT proxy) is never
     // silently weakened.
     if allow_dcp && allow_localhost_any && !proxy_forced {
-        sbpl!(sb, "(allow network-outbound)");
+        sbpl!(sb, "(allow network-outbound (remote tcp))");
     } else {
         // Outbound TCP restricted to port 443 (HTTPS only).
         // All Copilot/GitHub APIs use HTTPS — port 80 is not needed and would
